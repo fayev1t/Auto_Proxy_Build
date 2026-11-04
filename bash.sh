@@ -7,7 +7,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'HELP'
 用法：sudo bash bash.sh [--address 公网地址] [--port UDP端口] [--sni 证书名称]
 交互安装 sing-box 上游代理。支持 Debian/Ubuntu、systemd、amd64/arm64。
-会检查依赖、备份旧安装，并询问旧配置清理、凭据复用和是否开启系统 TCP BBR。
+会检查依赖、备份旧安装，并询问旧配置清理、凭据复用、HY2 端口 IP 白名单和是否开启系统 TCP BBR。
 HELP
   exit 0
 fi
@@ -112,13 +112,22 @@ class Runner:
         cwd: Path | None = None,
         timeout: int = 40,
     ) -> subprocess.CompletedProcess:
-        env = dict(os.environ, LC_ALL="C", SYSTEMD_COLORS="0", SYSTEMD_PAGER="cat")
+        env = dict(
+            os.environ,
+            LC_ALL="C",
+            SYSTEMD_COLORS="0",
+            SYSTEMD_PAGER="cat",
+            # Output is captured, so apt and needrestart must never wait on a hidden prompt.
+            DEBIAN_FRONTEND="noninteractive",
+            NEEDRESTART_SUSPEND="1",
+        )
         # sing-box otherwise uses the invoking sudo user's ownership for new files.
         for name in ("SUDO_USER", "SUDO_UID", "SUDO_GID"):
             env.pop(name, None)
         try:
             result = subprocess.run(
                 [str(arg) for arg in args],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 cwd=cwd,
@@ -386,6 +395,82 @@ def relay_report(address: str, inbound: dict, user: dict, certificate: str) -> s
     )
 
 
+NFT_TABLE = "auto_proxy"  # "table inet auto_proxy" belongs to this script alone
+
+
+def parse_networks(text: str) -> list:
+    """Relay sources for the whitelist, merged because nft rejects overlapping intervals."""
+    networks = []
+    for item in re.split(r"[\s,，、;；]+", text.strip()):
+        if not item:
+            continue
+        try:
+            if "%" in item:  # an IPv6 zone only means something on one host
+                raise ValueError(item)
+            network = ipaddress.ip_network(item, strict=False)
+        except ValueError as error:
+            raise InstallError(f"{item} 不是有效的 IP 或网段，不支持域名。") from error
+        if network.prefixlen == 0:
+            raise InstallError(f"{item} 等于不限制来源；不需要白名单就选 n。")
+        if ipaddress.ip_interface(item).ip != network.network_address:
+            raise InstallError(f"{item} 的主机位不为 0，网段应写成 {network}。")
+        networks.append(network)
+    if not networks:
+        raise InstallError("至少输入一个中转机 IP 或网段。")
+    return [
+        network
+        for version in (4, 6)
+        for network in ipaddress.collapse_addresses(n for n in networks if n.version == version)
+    ]
+
+
+def format_networks(networks: list) -> str:
+    return ", ".join(
+        str(item.network_address) if item.prefixlen == item.max_prefixlen else str(item)
+        for item in networks
+    )
+
+
+def read_whitelist(path: Path) -> tuple[int, list] | None:
+    """The port and sources of a whitelist file written by whitelist_rules()."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    port = re.search(r"udp dport (\d+) counter drop", text)
+    elements = ",".join(re.findall(r"elements = \{([^}]*)\}", text))
+    try:
+        return (int(port[1]), parse_networks(elements)) if port else None
+    except InstallError:
+        return None
+
+
+def whitelist_rules(port: int, networks: list) -> str:
+    """Drop HY2 packets from other sources; other tables, ports and TCP are left alone."""
+    sets = ""
+    for version in (4, 6):
+        items = [item for item in networks if item.version == version]
+        elements = f"    elements = {{ {format_networks(items)} }}\n" if items else ""
+        sets += (
+            f"  set hy2_allow_v{version} {{\n    type ipv{version}_addr\n    flags interval\n"
+            f"{elements}  }}\n"
+        )
+    return (
+        "#!/usr/sbin/nft -f\n"
+        "# Managed by auto_proxy bash.sh: only these sources may reach the HY2 UDP port.\n"
+        "# sing-box.service loads it before starting; rerun bash.sh to change or remove it.\n"
+        # Declaring, deleting and redefining the table replaces it in one transaction.
+        f"table inet {NFT_TABLE}\ndelete table inet {NFT_TABLE}\n"
+        f"table inet {NFT_TABLE} {{\n{sets}  chain hy2_input {{\n"
+        "    type filter hook input priority -10; policy accept;\n"
+        f'    udp dport {port} iif "lo" accept\n'
+        f"    udp dport {port} ip saddr @hy2_allow_v4 accept\n"
+        f"    udp dport {port} ip6 saddr @hy2_allow_v6 accept\n"
+        f"    udp dport {port} counter drop\n"
+        "  }\n}\n"
+    )
+
+
 SERVICE = "sing-box.service"
 
 
@@ -411,6 +496,14 @@ class Layout:
     @property
     def report(self) -> Path:
         return self.at("/etc/sing-box/relay-info.md")
+
+    @property
+    def whitelist(self) -> Path:
+        return self.at("/etc/sing-box/hy2-whitelist.nft")
+
+    @property
+    def whitelist_dropin(self) -> Path:
+        return self.at(f"/etc/systemd/system/{SERVICE}.d/auto-proxy-whitelist.conf")
 
 
 @dataclass
@@ -594,6 +687,13 @@ class Change:
     mode: int = 0o600
     uid: int = 0
     gid: int = 0
+
+
+@dataclass
+class Whitelist:
+    networks: list  # sources allowed to reach the HY2 port; empty means no whitelist
+    existed: bool  # this script's whitelist files were already on the host
+    nft: str = ""  # set whenever the kernel table may need loading or removing
 
 
 def atomic_copy(source: Path, target: Path, mode: int, uid: int, gid: int) -> None:
@@ -910,16 +1010,26 @@ def credential_path(value: str | None, base: Path) -> Path | None:
     return (path if path.is_absolute() else base / path).resolve()
 
 
-def managed_unit(binary: Path, config: Path) -> str:
-    def quote(path: Path) -> str:
-        return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
+def unit_quote(path: Path | str) -> str:
+    return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
+
+def managed_unit(binary: Path, config: Path) -> str:
     return (
         "[Unit]\nDescription=sing-box HY2 upstream\nAfter=network-online.target\n"
         "Wants=network-online.target\n\n[Service]\nType=exec\nUser=root\n"
-        f"ExecStart={quote(binary)} run -c {quote(config)}\n"
+        f"ExecStart={unit_quote(binary)} run -c {unit_quote(config)}\n"
         "Restart=on-failure\nRestartSec=2\nTimeoutStartSec=30\nTimeoutStopSec=30\n"
         "LimitNOFILE=1048576\n\n[Install]\nWantedBy=multi-user.target\n"
+    )
+
+
+def whitelist_dropin(nft: str, rules: Path) -> str:
+    # "+" runs nft as root even if the service drops privileges. When the rules cannot
+    # load, sing-box stays down rather than serving everyone.
+    return (
+        "# Managed by auto_proxy bash.sh: load the HY2 IP whitelist before sing-box starts.\n"
+        f"[Service]\nExecStartPre=+{unit_quote(nft)} -f {unit_quote(rules)}\n"
     )
 
 
@@ -1137,6 +1247,7 @@ class Installer:
         self,
         transaction: Transaction,
         service: Service,
+        whitelist: Whitelist,
         touched_service: bool,
         enabling_attempted: bool,
     ) -> list[str]:
@@ -1153,6 +1264,8 @@ class Installer:
         if enabling_attempted and service.enabled != "enabled":
             attempt(["disable", SERVICE])
         errors.extend(transaction.restore())
+        if touched_service and whitelist.nft:
+            errors.extend(self.restore_whitelist(whitelist.nft))
         if touched_service:
             attempt(["daemon-reload"])
             if enabling_attempted:
@@ -1173,6 +1286,110 @@ class Installer:
         except OSError as error:
             errors.append(f"回滚状态记录失败：{error}")
         return errors
+
+    def ensure_nft(self) -> str:
+        nft = shutil.which("nft")
+        if not nft:
+            say("安装 nftables…")
+            apt = [
+                "apt-get",
+                "-y",
+                "--no-install-recommends",
+                "-o",
+                "DPkg::Lock::Timeout=60",
+                "-o",
+                "Dpkg::Options::=--force-confdef",
+                "-o",
+                "Dpkg::Options::=--force-confold",
+            ]
+            try:
+                self.runner.run([*apt, "install", "nftables"], timeout=600)
+            except InstallError:
+                self.runner.run([*apt, "update"], timeout=600)
+                self.runner.run([*apt, "install", "nftables"], timeout=600)
+            nft = shutil.which("nft")
+            if not nft:
+                raise InstallError("装完 nftables 仍找不到 nft。")
+        self.runner.run([nft, "list", "tables"])  # containers often lack nf_tables
+        return nft
+
+    def plan_whitelist(self, port: int) -> Whitelist:
+        """Ask before deploying which sources may reach the HY2 port."""
+        rules, dropin = self.layout.whitelist, self.layout.whitelist_dropin
+        existed = rules.exists() or dropin.exists()
+        current: list = []
+        if existed:
+            found = read_whitelist(rules)
+            if found:
+                current = found[1]
+                say(f"现有 HY2 白名单（UDP {found[0]}）：{format_networks(current)}")
+            else:
+                say(f"现有白名单文件 {rules} 无法识别，保留的话按这次输入重写。")
+
+        def without_whitelist() -> Whitelist:
+            # Removing an old whitelist needs nft too, to drop its kernel table.
+            return Whitelist([], existed, (shutil.which("nft") or "") if existed else "")
+
+        if not self.prompt.confirm(
+            f"给 HY2 UDP {port} 加 IP 白名单？只放行中转机，没有云安全组的机器建议开", existed
+        ):
+            return without_whitelist()
+        # A killed dpkg leaves apt broken until repaired, so Ctrl-C waits for this step.
+        # Only signals from this step count; earlier probes may have swallowed one.
+        try:
+            with self.signals.deferred():
+                nft = self.ensure_nft()
+        except InstallError as error:
+            self.signals.checkpoint()  # interrupted: stop instead of calling nft unusable
+            say(f"白名单要用的 nftables 用不了：{error}")
+            if not self.prompt.confirm("不加白名单，继续安装？", False):
+                raise InstallError("已取消安装，原配置未修改。") from error
+            return without_whitelist()
+        self.signals.checkpoint()
+        while True:
+            answer = self.prompt.ask(
+                "放行的中转机 IP 或网段，多个用逗号或空格隔开", format_networks(current)
+            )
+            try:
+                networks = parse_networks(answer)
+                break
+            except InstallError as error:
+                say(error)
+        say(f"白名单：{format_networks(networks)}")
+        return Whitelist(networks, existed, nft)
+
+    def whitelist_changes(self, whitelist: Whitelist, port: int, stage: Path) -> list[Change]:
+        paths = (self.layout.whitelist, self.layout.whitelist_dropin)
+        if not whitelist.networks:
+            return [Change(path, None) for path in paths if path.exists()]
+        rules, dropin = stage / "hy2-whitelist.nft", stage / "whitelist.conf"
+        rules.write_text(whitelist_rules(port, whitelist.networks))
+        self.runner.run([whitelist.nft, "--check", "-f", str(rules)])
+        dropin.write_text(whitelist_dropin(whitelist.nft, paths[0]))
+        return [Change(paths[0], rules), Change(paths[1], dropin, 0o644)]
+
+    def sync_whitelist(self, whitelist: Whitelist, port: int) -> None:
+        """sing-box loaded the new rules before starting: confirm them, or drop a removed table."""
+        if not whitelist.nft:
+            return
+        listing = self.runner.run([whitelist.nft, "list", "table", "inet", NFT_TABLE], check=False)
+        if whitelist.networks:
+            if listing.returncode or f"udp dport {port} counter" not in listing.stdout:
+                raise InstallError("HY2 白名单没有加载到内核。")
+        elif listing.returncode == 0:
+            self.runner.run([whitelist.nft, "delete", "table", "inet", NFT_TABLE])
+
+    def restore_whitelist(self, nft: str) -> list[str]:
+        """Bring the kernel table back in line with the restored whitelist file."""
+        table = [nft, "list", "table", "inet", NFT_TABLE]
+        try:
+            if self.layout.whitelist.exists():
+                self.runner.run([nft, "-f", str(self.layout.whitelist)])
+            elif self.runner.run(table, check=False).returncode == 0:
+                self.runner.run([nft, "delete", "table", "inet", NFT_TABLE])
+        except InstallError as error:
+            return [f"恢复 HY2 白名单失败：{error}"]
+        return []
 
     def plan_bbr(self) -> bool:
         """Ask before deploying, so nothing after the deployment waits for the terminal."""
@@ -1277,8 +1494,9 @@ class Installer:
             stage = Path(directory)
             binary = prepare_binary(self.runner, service, architecture, stage)
             user, certificate, key, reuse, watched = self.credentials(inbound, service, stage, sni)
+            whitelist = self.plan_whitelist(port)
             bbr = self.plan_bbr()
-            changes = []
+            changes = self.whitelist_changes(whitelist, port, stage)
             if not reuse:
                 target_cert, target_key = (
                     service.config.parent / "hy2.crt",
@@ -1352,6 +1570,7 @@ class Installer:
                     self.runner.run(["systemctl", "daemon-reload"])
                     self.runner.run(["systemctl", "restart", SERVICE])
                     self.wait_ready(service, port)
+                    self.sync_whitelist(whitelist, port)
                     if service.enabled != "enabled":
                         enabling_attempted = True
                         self.runner.run(["systemctl", "enable", SERVICE])
@@ -1364,7 +1583,7 @@ class Installer:
                 except BaseException as error:
                     say("安装未完成，正在恢复原文件和服务状态…", file=sys.stderr)
                     failures = self.rollback(
-                        transaction, service, touched_service, enabling_attempted
+                        transaction, service, whitelist, touched_service, enabling_attempted
                     )
                     if failures:
                         raise InstallError(
@@ -1374,6 +1593,11 @@ class Installer:
                     raise InstallError(
                         f"{error}\n已回滚本次部署变更；备份位于 {transaction.backup}"
                     ) from error
+                if whitelist.networks:
+                    allowed = format_networks(whitelist.networks)
+                    say(f"HY2 白名单已生效：UDP {port} 只放行 {allowed}。")
+                elif whitelist.existed:
+                    say(f"已删除 HY2 白名单，UDP {port} 对所有 IP 开放。")
                 if bbr:
                     self.apply_bbr(transaction, stage)
                 say(
