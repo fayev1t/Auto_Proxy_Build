@@ -1,0 +1,5 @@
+# Only publish the standalone installer and this ignore file.
+/*
+!/.gitignore
+!/bash.sh
+!/README.md
