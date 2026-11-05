@@ -365,6 +365,43 @@ def choose_inbound(config: dict, prompt) -> tuple[dict, int | None]:
     }, None
 
 
+def private_guard(config: dict, inbound: dict) -> bool:
+    """Keep relay clients off this host's loopback, LAN and cloud metadata addresses.
+
+    Domains are resolved first so names that point at private addresses are caught too.
+    Both rules go first so earlier route rules cannot send such traffic out. Returns
+    whether the route changed.
+    """
+    if not inbound.get("tag"):
+        tags = {item.get("tag") for item in config.get("inbounds", [])}
+        tag = "in-hy2-relay"
+        while tag in tags:
+            tag += "-new"
+        inbound["tag"] = tag
+    tag = inbound["tag"]
+    route = config.setdefault("route", {})
+    rules = route.setdefault("rules", [])
+    if not isinstance(rules, list):
+        raise InstallError("旧配置的 route.rules 必须是数组。")
+    resolve = {"inbound": [tag], "action": "resolve"}
+    if {"ip_version": 6, "action": "reject"} in rules:
+        resolve["strategy"] = "ipv4_only"  # match a route that already rejects IPv6
+    reject = {"inbound": [tag], "ip_is_private": True, "action": "reject"}
+    if rules[:2] == [resolve, reject]:
+        return False
+
+    def managed(rule) -> bool:  # also drops an older resolve rule whose strategy changed
+        return rule == reject or (
+            isinstance(rule, dict)
+            and rule.get("inbound") == [tag]
+            and rule.get("action") == "resolve"
+            and set(rule) <= {"inbound", "action", "strategy"}
+        )
+
+    rules[:] = [resolve, reject, *(rule for rule in rules if not managed(rule))]
+    return True
+
+
 def public_certificate(path: Path) -> str:
     # Some existing PEM files combine certificates and private keys.
     blocks = re.findall(
@@ -1524,6 +1561,8 @@ class Installer:
                 config.setdefault("inbounds", []).append(inbound)
             else:
                 config["inbounds"][inbound_index] = inbound
+            if private_guard(config, inbound):
+                say("已为 HY2 入站加上路由规则：拒绝访问本机、内网和云元数据地址。")
             staged_config = copy.deepcopy(config)
             staged_inbound = staged_config["inbounds"][
                 inbound_index if inbound_index is not None else -1
